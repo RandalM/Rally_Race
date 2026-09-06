@@ -1,0 +1,15 @@
+# ESP-IDF build output
+**/build/
+**/build_*/
+
+# ESP-IDF generated configuration backups
+**/sdkconfig.old
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+
+# Local logs and temporary files
+*.log
+*.tmp
