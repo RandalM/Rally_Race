@@ -1,3 +1,13 @@
+/**
+ * @file car.c
+ * @brief Race timer and telemetry recorder mounted on the vehicle.
+ *
+ * The car is the authoritative clock.  It starts its local monotonic timer
+ * when a start packet arrives and stops it when a finish packet arrives.
+ * Gates only report events; they do not share clocks or communicate with one
+ * another.
+ */
+
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -18,17 +28,24 @@
 #define BLUE_LED_GPIO   GPIO_NUM_0  // Indicator LED (On = Staged/Racing, Off = Idle/Finished)
 
 #define TELEMETRY_BURST_COUNT 5
+#define STAGING_BURST_COUNT    5   // Duplicate copies of the staging request (broadcast frames are unacknowledged)
+#define STAGING_BURST_DELAY_MS 5   // Delay between staging burst frames
 #define STAGING_TIMEOUT_MS    30000
+#define RACE_FINISHED_HOLD_MS 2000 // How long the finished indication is held before re-arming
 
 #define MULTI_LED_PIN_MASK ((1ULL << GREEN_LED_GPIO) | (1ULL << RED_LED_GPIO) | (1ULL << BLUE_LED_GPIO))
 
 static const char *TAG = "CAR_ESP32";
 
+/* Coarse vehicle lifecycle used by the receive callback and LED task. */
 typedef enum { CAR_IDLE, WAITING_FOR_GPU_BEAM, RACING, RACE_FINISHED } CarState;
 static volatile CarState current_state = CAR_IDLE;
+/* esp_timer_get_time() values are microseconds since boot. */
 static uint64_t race_start_time = 0;
 static esp_timer_handle_t staging_timeout_timer;
+static esp_timer_handle_t finish_hold_timer;
 
+/* Return to idle if the driver stages but never crosses the start gate. */
 static void staging_timeout_callback(void *arg) {
     if (current_state == WAITING_FOR_GPU_BEAM) {
         current_state = CAR_IDLE;
@@ -37,13 +54,26 @@ static void staging_timeout_callback(void *arg) {
     }
 }
 
-// Local storage array for the active race session
+/*
+ * Return to idle once the finished indication has been visible for a bit.
+ * This runs on the esp_timer task rather than blocking inside the ESP-NOW
+ * receive callback, which is shared with every other incoming radio frame.
+ */
+static void finish_hold_timer_callback(void *arg) {
+    current_state = CAR_IDLE;
+    ESP_LOGI(TAG, "Car reset to IDLE. Ready for next run staging.");
+}
+
+/* Mutable telemetry assembled during the current race. */
 static telemetry_packet_t live_race_telemetry;
 
-// Global tracking array for burst sequence deduplication (Index maps to Gate ID)
+/*
+ * Each gate repeats a packet several times. The gate ID indexes this table,
+ * allowing the car to accept the first copy and reject the rest.
+ */
 static uint32_t last_processed_sequence[100] = {0}; 
 
-// Explicit structure matching the gate's broadcast layout
+/* Local receive type matching gate_packet_t's on-air layout. */
 typedef struct {
     uint8_t command_id; 
     uint8_t gate_id;     
@@ -51,11 +81,11 @@ typedef struct {
 } inbound_gate_packet_t;
 
 
-// HELPER: Write telemetry struct directly into NVS Flash Memory
+/** Save the most recent completed race so a reboot cannot lose the result. */
 void save_race_to_flash(telemetry_packet_t *data) {
     nvs_handle_t my_handle;
     if (nvs_open("race_storage", NVS_READWRITE, &my_handle) == ESP_OK) {
-        // Save the raw byte block safely to flash memory
+        /* Store the complete fixed-size packet as one NVS blob. */
         nvs_set_blob(my_handle, "last_race", data, sizeof(telemetry_packet_t));
         nvs_commit(my_handle);
         nvs_close(my_handle);
@@ -63,7 +93,7 @@ void save_race_to_flash(telemetry_packet_t *data) {
     }
 }
 
-// HELPER: Read and output historical backup on system startup
+/** Print a previously saved result, if one exists, after boot. */
 void load_and_print_flash_backup(void) {
     nvs_handle_t my_handle;
     telemetry_packet_t backup;
@@ -86,6 +116,10 @@ void load_and_print_flash_backup(void) {
     }
 }
 
+/**
+ * Human-facing status LEDs. This task never changes race state; it only
+ * reflects the state selected by the packet/button logic.
+ */
 static void led_indicator_task(void *pvParameters) {
     while (1) {
         switch (current_state) {
@@ -128,21 +162,28 @@ static void led_indicator_task(void *pvParameters) {
     }
 }
 
+/**
+ * Handle gate packets.
+ *
+ * The callback timestamps receipt immediately. This is important because the
+ * start and finish gates have independent clocks and no direct link between
+ * them. Only packets valid for the current car state affect the race.
+ */
 static void esp_now_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len) {
     if (len == sizeof(inbound_gate_packet_t)) {
         inbound_gate_packet_t *packet = (inbound_gate_packet_t *)data;
         uint64_t current_time = esp_timer_get_time();
 
-        // Safety array bounds check for Gate IDs
+        /* Never use an untrusted gate ID as an array index. */
         if (packet->gate_id >= 100) return;
 
-        // DEDUPLICATION FILTER: If sequence is old or repeated, drop it instantly
+        /* Discard repeated copies and packets from an older gate event. */
         if (packet->sequence_num <= last_processed_sequence[packet->gate_id])return;
 
-        // Lock out the rest of this gate's redundancy burst immediately
+        /* Claim the sequence before any state-specific processing. */
         last_processed_sequence[packet->gate_id] = packet->sequence_num;
 
-        // 1. START GATE TRIGGER
+        /* Start: stop the staging watchdog and establish the car's clock. */
         if (packet->command_id == 1 && current_state == WAITING_FOR_GPU_BEAM) {
             esp_timer_stop(staging_timeout_timer);
             race_start_time = current_time;
@@ -154,7 +195,7 @@ static void esp_now_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t 
             ESP_LOGI(TAG, ">>> GO! Start Gate beam broken. Race Timer started. <<<");
         }
         
-        // 2. INTERMEDIATE SPLIT TRIGGER
+        /* Intermediate: append elapsed time without changing race state. */
         else if (packet->command_id == 3 && current_state == RACING) {
             uint32_t split_ms = (uint32_t)((current_time - race_start_time) / 1000);
             uint8_t index = live_race_telemetry.recorded_splits_count;
@@ -170,16 +211,16 @@ static void esp_now_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t 
             }
         }
         
-        // 3. FINISH LINE TRIGGER (Fully handled scenario)
+        /* Finish: finalize, persist, broadcast, then return to idle. */
         else if (packet->command_id == 2 && current_state == RACING) {
             uint64_t final_us = current_time - race_start_time;
             live_race_telemetry.total_race_time_ms = (uint32_t)(final_us / 1000);
             
-            // Assign a unique session ID based on microsecond boot markers
+            /* The receive timestamp makes the session ID unique after boot. */
             live_race_telemetry.session_id = (uint32_t)current_time;
             current_state = RACE_FINISHED;
             
-            // 1. BACKUP IMMEDIATELY: Save to local flash BEFORE doing any wireless delivery
+            /* Persist before radio transmission so the result survives failure. */
             save_race_to_flash(&live_race_telemetry);
             
 
@@ -190,7 +231,7 @@ static void esp_now_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t 
 
             ESP_LOGI(TAG, "Race Complete! Launching %d-packet telemetry burst...", TELEMETRY_BURST_COUNT);
 
-            // 2. TRANSMIT BURST: Broadcast multiple copies to the data collector.
+            /* Repeat the completed result to improve delivery probability. */
             for (int i = 0; i < TELEMETRY_BURST_COUNT; i++) {
                 esp_err_t send_ret = esp_now_send(
                     BROADCAST_MAC,
@@ -203,10 +244,15 @@ static void esp_now_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t 
                 esp_rom_delay_us(5000); // 5ms separation space
             }
             
-            // State cleanup: Ready for another run after a short rest period
-            vTaskDelay(2000 / portTICK_PERIOD_MS); 
-            current_state = CAR_IDLE;
-            ESP_LOGI(TAG, "Car reset to IDLE. Ready for next run staging.");
+            /*
+             * Give the finished indication time to be visible before
+             * rearming, without blocking this callback. The ESP-NOW
+             * receive path is shared across all incoming frames, so
+             * blocking here would leave the car deaf to other radio
+             * traffic for the entire hold period.
+             */
+            ESP_ERROR_CHECK(esp_timer_start_once(finish_hold_timer,
+                                                 RACE_FINISHED_HOLD_MS * 1000));
         }
     }
 }
@@ -214,7 +260,7 @@ static void esp_now_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t 
 
 
 void app_main(void) {
-    // 1. Initialize NVS Flash (Mandatory first step)
+    /* NVS is required by the Wi-Fi stack and stores the backup result. */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -222,10 +268,10 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    // READ SAVED CONSOLE DATA IMMEDIATELY UPON REBOOT
+    /* Report any result left behind by a previous interrupted run. */
     load_and_print_flash_backup();
 
-    // 2. Initialize the Network Interfaces
+    /* Build the event loop and station interface used by ESP-NOW. */
     ESP_ERROR_CHECK(esp_netif_init());
     
     // 3. Create the System Event Loop Task
@@ -235,7 +281,7 @@ void app_main(void) {
     // --- THIS IS THE CRITICAL MISSING STEP THAT CAUSES THE ESP-NOW INIT PANIC ---
     esp_netif_create_default_wifi_sta();
     
-    // 5. Initialize and Start Wi-Fi
+    /* Bring up the radio and force the shared race channel. */
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM)); // Bypass flash storage degradation
@@ -243,7 +289,7 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_wifi_start()); // Physical radio must be fully awake
     ESP_ERROR_CHECK(esp_wifi_set_channel(ESP_NOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
 
-    // 6. Safely Initialize ESP-NOW
+    /* ESP-NOW carries both staging requests and gate events. */
     // If it still fails, it will gracefully log the string name instead of a cryptic crash
     esp_err_t esp_now_err = esp_now_init();
     if (esp_now_err != ESP_OK) {
@@ -253,7 +299,7 @@ void app_main(void) {
         ESP_LOGI("STARTUP", "ESP-NOW Initialized Successfully!");
     }
     
-    // 7. Register standard callback functions
+    /* Receive callbacks run asynchronously from the main loop. */
     ESP_ERROR_CHECK(esp_now_register_recv_cb(esp_now_recv_cb));
 
     const esp_timer_create_args_t staging_timeout_timer_args = {
@@ -262,14 +308,20 @@ void app_main(void) {
     };
     ESP_ERROR_CHECK(esp_timer_create(&staging_timeout_timer_args, &staging_timeout_timer));
 
-    // Register the broadcast peer for staging and telemetry packets.
+    const esp_timer_create_args_t finish_hold_timer_args = {
+        .callback = &finish_hold_timer_callback,
+        .name = "finish_hold",
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&finish_hold_timer_args, &finish_hold_timer));
+
+    /* Add the broadcast peer so staging and telemetry can be sent. */
     esp_now_peer_info_t broadcast_peer = { .channel = ESP_NOW_CHANNEL, .ifidx = WIFI_IF_STA, .encrypt = false };
     memcpy(broadcast_peer.peer_addr, BROADCAST_MAC, 6);
     ESP_ERROR_CHECK(esp_now_add_peer(&broadcast_peer));
 
     ESP_LOGI("STARTUP", "Peers Logged Successfully!!!");
 
-    // Hardware IO Pins Initialization
+    /* Configure the physical staging button and status LEDs. */
     gpio_config_t button_conf = {
         .pin_bit_mask = (1ULL << BUTTON_GPIO),
         .mode = GPIO_MODE_INPUT,
@@ -292,7 +344,7 @@ void app_main(void) {
 
     gpio_config(&led_conf);
 
-    //init LEDs to off
+    /* Start in a known visual state before creating the LED task. */
     gpio_set_level(GREEN_LED_GPIO, 0);
     gpio_set_level(BLUE_LED_GPIO, 0);
     gpio_set_level(RED_LED_GPIO, 0);
@@ -303,22 +355,30 @@ void app_main(void) {
     button_packet_t stage_packet = { .command_id = 1 };
 
     ESP_LOGI(TAG, "Vehicle Online. Ready to press button to stage.");
-    // Place this inside app_main() right before your main button loop
+    /* LED rendering is independent of the button polling loop. */
     xTaskCreate(led_indicator_task, "led_indicator_task", 4096, NULL, 1, NULL);
 
     while (1) {
-        // Handle physical staging request button press
+        /* A low button level requests that the start gate arm itself. */
         if (gpio_get_level(BUTTON_GPIO) == 0 && current_state == CAR_IDLE) {
             ESP_LOGI(TAG, "Staging button pressed! Broadcasting request to Start Gate...");
-            
-            // Broadcast arming signal to trackside gates
-            esp_now_send(BROADCAST_MAC, (uint8_t *)&stage_packet, sizeof(stage_packet));
-            
+
+            /*
+             * The start gate accepts beam events only after this packet, and
+             * broadcast frames are never acknowledged or retried by the
+             * radio. Send a burst, same as every other event in this
+             * system, so one lost frame can't leave the gate un-armed.
+             */
+            for (int i = 0; i < STAGING_BURST_COUNT; i++) {
+                esp_now_send(BROADCAST_MAC, (uint8_t *)&stage_packet, sizeof(stage_packet));
+                esp_rom_delay_us(STAGING_BURST_DELAY_MS * 1000);
+            }
+
             current_state = WAITING_FOR_GPU_BEAM;
             ESP_ERROR_CHECK(esp_timer_start_once(staging_timeout_timer,
                                                  STAGING_TIMEOUT_MS * 1000));
             
-            vTaskDelay(500 / portTICK_PERIOD_MS); // Debounce delay
+            /* Ignore switch bounce and repeated staging requests briefly. */
         }
         vTaskDelay(20 / portTICK_PERIOD_MS);
     }
